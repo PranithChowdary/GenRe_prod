@@ -306,11 +306,34 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
     with st.expander("🔍 View Full Profile & Feature Status", expanded=False):
         st.dataframe(pd.DataFrame(prof_data), width="stretch")
 
-    st.divider()
     
     # Step 2: Advisory Configuration
     with st.expander("🛠️ STEP 2: Advisory Configuration", expanded=True):
-        st.info("Set your preferences. Adjust the sliders to define the range of acceptable values for each feature. The system will generate recommendations within these bounds.")
+        st.info("Define the allowable financial deltas based on time and effort.")
+        
+        # 1. Global Strategic Controls
+        col_ctrl1, col_ctrl2 = st.columns(2)
+        with col_ctrl1:
+            timeframe = st.selectbox(
+                "Target Actionable Timeframe", 
+                options=[3, 6, 12], 
+                format_func=lambda x: f"{x} Months", 
+                index=1,
+                key="ui_timeframe"
+            )
+        with col_ctrl2:
+            base_effort = st.slider(
+                "Relative Effort Level (Allowable % change)", 
+                min_value=1.0, max_value=25.0, value=5.0, step=1.0,
+                key="ui_effort"
+            )
+        
+        # Calculate time-weighted percentage change for visual sliders
+        # Logic: (Base Effort) * (Multiplier based on 3-month blocks)
+        total_allowed_pct = (base_effort / 100.0) * (timeframe / 3.0)
+        
+        st.info(f"💡 **Strategic Goal:** Seeking approval with a **{total_allowed_pct:.1%}** allowable variance over a **{timeframe}-month** horizon.")
+        
         tab_num1, tab_num2, tab_cat = st.tabs(["Financials & Loan Ranges", "Credit Indicator Ranges", "Categorical Transitions"])
 
         # High-impact features for the first tab
