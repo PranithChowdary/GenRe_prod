@@ -45,6 +45,7 @@ class GenReV3(nn.Module):
 
     @torch.no_grad()
     def sample_algorithm2(self, src_bins, src_cat, temp=0.1):
+        self.eval()
         bs = src_bins.size(0)
         memory = self.transformer.encoder(self.pos_encoder(self._embed(src_bins, src_cat)))
         curr = self.sos_emb.expand(bs, -1, -1)
@@ -126,63 +127,159 @@ def load_assets():
     ann = FlexibleANNProxy(meta['num_cont'], cat_vocabs, emb_dim=32)
     ann.load_state_dict(torch.load(os.path.join(MODEL_DIR, "ann_flexible.pt"), map_location="cpu")["model_state"])
     ann.eval()
+
+    # Robust Feature Extraction: Identify which features the classifier actually uses
+    if "features_used_by_model" not in meta:
+        with torch.no_grad():
+            # Check continuous feature weights in projection layer
+            cont_weights = ann.cont_proj.weight.abs().sum(dim=0)
+            used_cont_indices = (cont_weights > 1e-6).nonzero(as_tuple=True)[0].tolist()
+            used_cont = [meta['continuous_features'][i] for i in used_cont_indices]
+            
+            # For categorical, check if embeddings are all zero (unlikely but for completeness)
+            used_cat = []
+            for i, name in enumerate(meta['categorical_features']):
+                if ann.cat_embeddings[i].weight.abs().sum() > 1e-6:
+                    used_cat.append(name)
+            
+            meta["features_used_by_model"] = used_cont + used_cat
+            
     return meta, bin_edges, scaler, genre, ann, X_cont, X_cat, y
 
 meta, bin_edges, scaler, genre, ann, X_cont, X_cat, y_all = load_assets()
 
+# Compute bin centers for constraint checking
+bin_centers = [np.array([(edges[i] + edges[i+1]) / 2 for i in range(len(edges)-1)]) for edges in bin_edges]
+
 
 # Recourse Generation
 @torch.no_grad()
-def generate_demo_recourse(fact_bins, fact_cat, k=100, lam=0.01):
-    best_bins, best_cat = fact_bins.clone(), fact_cat.clone()
-    f_norm = torch.tensor([safe_inverse_transform(bin_edges, fact_bins[0].tolist(), meta)], dtype=torch.float32)
-    p_init = ann(f_norm, fact_cat).item()
-    best_prob, best_score = p_init, -1e9
-
-    for i_sample in range(k):
-        # Temperature scheduling for maximum exploration
-        temp = 0.1 + (i_sample / k) * 0.6
-        gen_bins, gen_cats = genre.sample_algorithm2(fact_bins, fact_cat, temp=temp)
+def constrained_sample_algorithm2(fact_bins, fact_cat, meta, constraints, temp=0.5):
+    genre.eval()
+    bs = fact_bins.size(0)
+    device = fact_bins.device
+    
+    # Encode factual state as conditioning context
+    memory = genre.transformer.encoder(genre.pos_encoder(genre._embed(fact_bins, fact_cat)))
+    
+    curr = genre.sos_emb.expand(bs, -1, -1)
+    s_cont, s_cat = [], []
+    
+    # --- Continuous Features Loop ---
+    for j in range(meta['num_cont']):
+        feat_name = meta['continuous_features'][j]
         
-        # DEMO MANIFOLD RULE: Strict -5 to +5 bin clamp for realism
-        search_radius = 3 # changed from 5 to 3 for a more focused demo
-        diff = gen_bins - fact_bins
-        clamped_diff = torch.clamp(diff, -search_radius, search_radius)
+        tgt = genre.pos_encoder(curr)
+        mask = genre.transformer.generate_square_subsequent_mask(tgt.size(1)).to(device)
+        h = genre.transformer.decoder(tgt, memory, tgt_mask=mask)[:, -1, :]
         
-        for i in range(meta['num_cont']):
-            if meta['continuous_features'][i] in meta['immutable_features']:
-                gen_bins[:, i] = fact_bins[:, i]
-            else:
-                gen_bins[:, i] = fact_bins[:, i] + clamped_diff[:, i]
-                gen_bins[:, i] = torch.clamp(gen_bins[:, i], 0, len(bin_edges[i]) - 2)
-
-        for i, name in enumerate(meta['categorical_features']):
-            if name in meta['immutable_features']:
-                gen_cats[:, i] = fact_cat[:, i]
-
-        # Evaluation
-        gn_norm_vals = safe_inverse_transform(bin_edges, gen_bins[0].tolist(), meta)
-        gn_norm = torch.tensor([gn_norm_vals], dtype=torch.float32)
-        probs = ann(gn_norm, gen_cats).item()
+        logits = genre.cont_heads[j](h)
         
-        n_cost = torch.abs(gen_bins - fact_bins).float().sum()
-        c_cost = (gen_cats != fact_cat).float().sum() * 5.0
-        total_cost = (n_cost + c_cost) * 0.05
+        # Apply Constraints only if feature is used by classifier
+        c_mask = torch.zeros_like(logits)
+        if feat_name in meta.get("features_used_by_model", []):
+            if feat_name in constraints:
+                # UI provides constraints as (min, max) tuple
+                c_bounds = constraints[feat_name]
+                if isinstance(c_bounds, (tuple, list)):
+                    c_min, c_max = c_bounds
+                else:
+                    c_min, c_max = None, None # Fallback
+                
+                b_centers = torch.tensor(bin_centers[j], device=device)
+                
+                invalid = torch.zeros_like(c_mask[0], dtype=torch.bool)
+                if c_min is not None: invalid |= (b_centers < c_min)
+                if c_max is not None: invalid |= (b_centers > c_max)
+                c_mask[0, invalid] = -1e9
 
-        # DEMO SCORING: Aggressively target the 90%+ probability threshold
-        if probs < 0.90:
-            score = probs * 100.0 - (lam * total_cost) # Heavily favor probability
+        # Immutable check
+        if feat_name in meta['immutable_features']:
+            choice = fact_bins[:, j].unsqueeze(-1)
         else:
-            score = 1000.0 + (probs * 10.0) - total_cost # Found 90%+, now minimize cost
+            probs = torch.softmax((logits + c_mask) / temp, dim=-1)
+            choice = torch.multinomial(probs, 1)
+            
+        s_cont.append(choice)
+        next_emb = genre.cont_embs[j](choice.squeeze(-1)).unsqueeze(1)
+        curr = torch.cat([curr, next_emb], dim=1)
+        
+    # --- Categorical Features Loop ---
+    for i in range(meta['num_cat']):
+        name = meta['categorical_features'][i]
+        
+        tgt = genre.pos_encoder(curr)
+        mask = genre.transformer.generate_square_subsequent_mask(tgt.size(1)).to(device)
+        h = genre.transformer.decoder(tgt, memory, tgt_mask=mask)[:, -1, :]
+        
+        logits = genre.cat_heads[i](h)
+        
+        c_mask = torch.zeros_like(logits)
+        # Apply categorical constraints (multiselect from UI)
+        if name in meta.get("features_used_by_model", []) and name in constraints:
+            allowed_vals = constraints[name]
+            v_map = meta["categorical_value_maps"][name]
+            allowed_indices = [v_map[v] for v in allowed_vals if v in v_map]
+            
+            if allowed_indices:
+                all_indices = torch.arange(logits.size(-1), device=device)
+                invalid = ~torch.isin(all_indices, torch.tensor(allowed_indices, device=device))
+                c_mask[0, invalid] = -1e9
+
+        if name in meta['immutable_features']:
+            choice = fact_cat[:, i].unsqueeze(-1)
+        else:
+            probs = torch.softmax((logits + c_mask) / temp, dim=-1)
+            choice = torch.multinomial(probs, 1)
+            
+        s_cat.append(choice)
+        next_emb = genre.cat_embs[i](choice.squeeze(-1)).unsqueeze(1)
+        curr = torch.cat([curr, next_emb], dim=1)
+        
+    return torch.cat(s_cont, dim=1), torch.cat(s_cat, dim=1)
+
+@torch.no_grad()
+def generate_demo_recourse(fact_bins, fact_cat, constraints, k=10, temp=0.5, lam=0.01):
+    """
+    Plug-n-play recourse generator that searches for the best actionable path within constraints.
+    Uses scoring logic to balance approval probability and actionability cost.
+    """
+    best_bins, best_cat, best_prob = fact_bins, fact_cat, -1.0
+    best_score = -1e9
+    
+    for _ in range(k):
+        r_bins, r_cat = constrained_sample_algorithm2(fact_bins, fact_cat, meta, constraints, temp=temp)
+        
+        # Evaluate using ANN
+        r_cont_vals = safe_inverse_transform(bin_edges, r_bins[0].tolist(), meta)
+        r_cont_t = torch.tensor([r_cont_vals], dtype=torch.float32)
+        
+        prob = ann(r_cont_t, r_cat).item()
+        
+        # Scoring logic: probability - cost penalty
+        n_cost = torch.abs(r_bins.float() - fact_bins.float()).sum().item()
+        c_cost = (r_cat != fact_cat).float().sum().item() * 10.0
+        total_cost = (n_cost + c_cost) * 0.05
+        
+        if prob < 0.5:
+            score = prob - (lam * total_cost)
+        else:
+            # We are APPROVED. Now maximize probability and minimize cost.
+            score = 100.0 + (prob * 1.0) - (total_cost * 2.5)
 
         if score > best_score:
-            best_bins, best_cat, best_score, best_prob = gen_bins, gen_cats, score, probs
+            best_score = score
+            best_prob = prob
+            best_bins, best_cat = r_bins, r_cat
             
     return best_bins, best_cat, best_prob
 
 # Streamlit UI
+
+# Adding logo
+st.image("GenRe_logo.png")
 st.set_page_config(page_title="SBI Decision Intelligence", layout="wide")
-st.title("🏦 SBI Smart Recourse Dashboard")
+st.title("🏦 SBI Smart Recourse")
 
 # Initialize Session State
 if 'view_mode' not in st.session_state: st.session_state.view_mode = "Individual"
@@ -222,7 +319,7 @@ with st.sidebar:
             subset = np.random.choice(neg_indices, batch_size, replace=False)
             
             results = []
-            recourses = []
+            recourse_details = []
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -241,8 +338,8 @@ with st.sidebar:
                 f_b = [np.clip(np.digitize(f_c_s[0, j], bin_edges[j]) - 1, 0, len(bin_edges[j])-2) for j in range(len(f_c_s[0]))]
                 f_b_t = torch.tensor([f_b], dtype=torch.long)
                 
-                # Generate
-                r_b, r_cat, p_end = generate_demo_recourse(f_b_t, f_cat_t, k=100) # Slightly lower k for bulk speed
+                # Generate (using empty constraints for bulk mode)
+                r_b, r_cat, p_end = generate_demo_recourse(f_b_t, f_cat_t, {}, k=5)
                 
                 results.append({
                     "User ID": uid,
@@ -255,16 +352,15 @@ with st.sidebar:
                 # store complete recourse details for later display
                 r_cont_vals = safe_inverse_transform(bin_edges, r_b[0].tolist(), meta)
                 r_real = scaler.inverse_transform([r_cont_vals])[0]
-                recourses.append({
+                recourse_details.append({
                     "User ID": uid,
-                    "current_profile": {meta['continuous_features'][j]: format_financial(meta['continuous_features'][j], scaler.inverse_transform(f_c_t)[0, j]) for j in range(len(f_c_s[0]))},
                     "suggested_profile": {meta['continuous_features'][j]: format_financial(meta['continuous_features'][j], r_real[j]) for j in range(len(f_c_s[0]))}
                 })
                 
                 progress_bar.progress((i + 1) / batch_size)
             
             st.session_state.bulk_results = pd.DataFrame(results)
-            st.session_state.bulk_recourses = recourses
+            st.session_state.bulk_recourses = pd.DataFrame(recourse_details)
             status_text.text("Bulk Generation Complete!")
             
 if st.session_state.view_mode == "Individual" and st.session_state.user_idx is not None:
@@ -303,16 +399,17 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
             "Status": "🔒 Immutable" if name in meta['immutable_features'] else "✏️ Mutable"
         })
     
-    with st.expander("🔍 View Full Profile & Feature Status", expanded=False):
+    with st.expander("🔍 View Full Profile & Feature Status", expanded=True):
         st.dataframe(pd.DataFrame(prof_data), width="stretch")
 
+    st.divider()
     
     # Step 2: Advisory Configuration
-    with st.expander("🛠️ STEP 2: Advisory Configuration", expanded=True):
+    with st.expander("🛠️ STEP 2: Advisory Configuration", expanded=False):
         st.info("Define the allowable financial deltas based on time and effort.")
         
         # 1. Global Strategic Controls
-        col_ctrl1, col_ctrl2 = st.columns(2)
+        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
         with col_ctrl1:
             timeframe = st.selectbox(
                 "Target Actionable Timeframe", 
@@ -326,6 +423,12 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
                 "Relative Effort Level (Allowable % change)", 
                 min_value=1.0, max_value=25.0, value=5.0, step=1.0,
                 key="ui_effort"
+            )
+        with col_ctrl3:
+            lambda_cost = st.slider(
+                "Cost Sensitivity (Lambda)",
+                min_value=0.0, max_value=0.1, value=0.01, step=0.005,
+                key="ui_lambda"
             )
         
         # Calculate time-weighted percentage change for visual sliders
@@ -346,13 +449,20 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
                     f_idx = meta["continuous_features"].index(name)
                     curr_val = float(f_real[f_idx])
                     
-                    # Calculate -5/+5 Bin Manifold boundaries
+                    # Calculate -3/+3 Bin Manifold boundaries (UPDATED)
                     b_idx = np.clip(np.digitize(f_cont_scaled[0, f_idx], bin_edges[f_idx]) - 1, 0, len(bin_edges[f_idx]) - 2)
-                    b_min, b_max = np.clip(b_idx - 5, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 5, 0, len(bin_edges[f_idx]) - 2)
+                    b_min, b_max = np.clip(b_idx - 3, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 3, 0, len(bin_edges[f_idx]) - 2)
                     
-                    s_min = float((bin_edges[f_idx][b_min] + bin_edges[f_idx][b_min+1]) / 2.0)
-                    s_max = float((bin_edges[f_idx][b_max] + bin_edges[f_idx][b_max+1]) / 2.0)
+                    s_min_manifold = float((bin_edges[f_idx][b_min] + bin_edges[f_idx][b_min+1]) / 2.0)
+                    s_max_manifold = float((bin_edges[f_idx][b_max] + bin_edges[f_idx][b_max+1]) / 2.0)
                     
+                    # Apply User Variance Constraint (The "Strategic Goal")
+                    v_min = curr_val * (1 - total_allowed_pct)
+                    v_max = curr_val * (1 + total_allowed_pct)
+                    
+                    s_min = max(s_min_manifold, v_min)
+                    s_max = min(s_max_manifold, v_max)
+
                     # Ensure min < max and current value is within bounds
                     s_min = min(s_min, curr_val)
                     s_max = max(s_max, curr_val + 0.01)
@@ -370,12 +480,21 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
                 f_idx = meta["continuous_features"].index(name)
                 curr_val = float(f_real[f_idx])
                 
+                # Calculate -3/+3 Bin Manifold boundaries (UPDATED)
                 b_idx = np.clip(np.digitize(f_cont_scaled[0, f_idx], bin_edges[f_idx]) - 1, 0, len(bin_edges[f_idx]) - 2)
-                b_min, b_max = np.clip(b_idx - 5, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 5, 0, len(bin_edges[f_idx]) - 2)
+                b_min, b_max = np.clip(b_idx - 3, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 3, 0, len(bin_edges[f_idx]) - 2)
                 
-                s_min = float((bin_edges[f_idx][b_min] + bin_edges[f_idx][b_min+1]) / 2.0)
-                s_max = float((bin_edges[f_idx][b_max] + bin_edges[f_idx][b_max+1]) / 2.0)
+                s_min_manifold = float((bin_edges[f_idx][b_min] + bin_edges[f_idx][b_min+1]) / 2.0)
+                s_max_manifold = float((bin_edges[f_idx][b_max] + bin_edges[f_idx][b_max+1]) / 2.0)
                 
+                # Apply User Variance Constraint (The "Strategic Goal")
+                v_min = curr_val * (1 - total_allowed_pct)
+                v_max = curr_val * (1 + total_allowed_pct)
+                
+                s_min = max(s_min_manifold, v_min)
+                s_max = min(s_max_manifold, v_max)
+
+                # Ensure min < max and current value is within bounds
                 s_min = min(s_min, curr_val)
                 s_max = max(s_max, curr_val + 0.01)
 
@@ -398,8 +517,26 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
         f_bins = [np.clip(np.digitize(f_cont_scaled[0, i], bin_edges[i]) - 1, 0, len(bin_edges[i])-2) for i in range(len(f_real))]
         f_bins_t = torch.tensor([f_bins], dtype=torch.long)
         
+        # Collect UI Constraints
+        ui_constraints = {}
+        for name in meta["continuous_features"]:
+            if name not in meta["immutable_features"]:
+                if f"tab1_{name}" in st.session_state:
+                    ui_constraints[name] = st.session_state[f"tab1_{name}"]
+                elif f"tab2_{name}" in st.session_state:
+                    ui_constraints[name] = st.session_state[f"tab2_{name}"]
+
+        for name in meta["categorical_features"]:
+            if name not in meta["immutable_features"]:
+                if f"cat_{name}" in st.session_state:
+                    ui_constraints[name] = st.session_state[f"cat_{name}"]
+        
         with st.spinner("Generating recourse recommendations..."):
-            r_bins, r_cat, p_end = generate_demo_recourse(f_bins_t, torch.tensor(f_cat, dtype=torch.long), k=150)
+            r_bins, r_cat, p_end = generate_demo_recourse(
+                f_bins_t, torch.tensor(f_cat, dtype=torch.long), 
+                constraints=ui_constraints, k=150, 
+                lam=st.session_state.ui_lambda
+            )
         
         r_cont_vals = safe_inverse_transform(bin_edges, r_bins[0].tolist(), meta)
         r_real = scaler.inverse_transform([r_cont_vals])[0]
