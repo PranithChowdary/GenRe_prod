@@ -239,13 +239,12 @@ def constrained_sample_algorithm2(fact_bins, fact_cat, meta, constraints, temp=0
     return torch.cat(s_cont, dim=1), torch.cat(s_cat, dim=1)
 
 @torch.no_grad()
-def generate_demo_recourse(fact_bins, fact_cat, constraints, k=10, temp=0.5, lam=0.01):
+def generate_demo_recourse(fact_bins, fact_cat, constraints, k=10, temp=0.5, lam=0.01, num_results=1):
     """
-    Plug-n-play recourse generator that searches for the best actionable path within constraints.
-    Uses scoring logic to balance approval probability and actionability cost.
+    Plug-n-play recourse generator that searches for multiple actionable paths within constraints.
+    Returns either a single best candidate (if num_results=1) or a list of top unique candidates.
     """
-    best_bins, best_cat, best_prob = fact_bins, fact_cat, -1.0
-    best_score = -1e9
+    candidates = []
     
     for _ in range(k):
         r_bins, r_cat = constrained_sample_algorithm2(fact_bins, fact_cat, meta, constraints, temp=temp)
@@ -266,13 +265,33 @@ def generate_demo_recourse(fact_bins, fact_cat, constraints, k=10, temp=0.5, lam
         else:
             # We are APPROVED. Now maximize probability and minimize cost.
             score = 100.0 + (prob * 1.0) - (total_cost * 2.5)
-
-        if score > best_score:
-            best_score = score
-            best_prob = prob
-            best_bins, best_cat = r_bins, r_cat
             
-    return best_bins, best_cat, best_prob
+        candidates.append({
+            "bins": r_bins,
+            "cat": r_cat,
+            "prob": prob,
+            "score": score
+        })
+        
+    # Sort by score descending
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Filter for unique candidates to provide variety
+    unique_candidates = []
+    seen_keys = set()
+    for cand in candidates:
+        key = (tuple(cand['bins'][0].tolist()), tuple(cand['cat'][0].tolist()))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_candidates.append(cand)
+        if len(unique_candidates) >= num_results:
+            break
+            
+    if num_results == 1:
+        best = unique_candidates[0]
+        return best['bins'], best['cat'], best['prob']
+    
+    return unique_candidates
 
 # Streamlit UI
 
@@ -449,9 +468,9 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
                     f_idx = meta["continuous_features"].index(name)
                     curr_val = float(f_real[f_idx])
                     
-                    # Calculate -3/+3 Bin Manifold boundaries (UPDATED)
+                    # Calculate -20/+20 Bin Manifold boundaries (Expanded to allow effort-level variance)
                     b_idx = np.clip(np.digitize(f_cont_scaled[0, f_idx], bin_edges[f_idx]) - 1, 0, len(bin_edges[f_idx]) - 2)
-                    b_min, b_max = np.clip(b_idx - 3, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 3, 0, len(bin_edges[f_idx]) - 2)
+                    b_min, b_max = np.clip(b_idx - 20, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 20, 0, len(bin_edges[f_idx]) - 2)
                     
                     s_min_manifold = float((bin_edges[f_idx][b_min] + bin_edges[f_idx][b_min+1]) / 2.0)
                     s_max_manifold = float((bin_edges[f_idx][b_max] + bin_edges[f_idx][b_max+1]) / 2.0)
@@ -469,7 +488,8 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
 
                     with cols[i % 2]:
                         label = f"{name} (Current: {format_financial(name, curr_val)})"
-                        st.slider(label, s_min, s_max, (s_min, s_max), key=f"tab1_{name}")
+                        # Key depends on effort/timeframe to force reset when global strategy changes
+                        st.slider(label, s_min, s_max, (s_min, s_max), key=f"tab1_{name}_{base_effort}_{timeframe}")
         
         with tab_num2:
             cols = st.columns(2)
@@ -480,9 +500,9 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
                 f_idx = meta["continuous_features"].index(name)
                 curr_val = float(f_real[f_idx])
                 
-                # Calculate -3/+3 Bin Manifold boundaries (UPDATED)
+                # Calculate -20/+20 Bin Manifold boundaries
                 b_idx = np.clip(np.digitize(f_cont_scaled[0, f_idx], bin_edges[f_idx]) - 1, 0, len(bin_edges[f_idx]) - 2)
-                b_min, b_max = np.clip(b_idx - 3, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 3, 0, len(bin_edges[f_idx]) - 2)
+                b_min, b_max = np.clip(b_idx - 20, 0, len(bin_edges[f_idx]) - 2), np.clip(b_idx + 20, 0, len(bin_edges[f_idx]) - 2)
                 
                 s_min_manifold = float((bin_edges[f_idx][b_min] + bin_edges[f_idx][b_min+1]) / 2.0)
                 s_max_manifold = float((bin_edges[f_idx][b_max] + bin_edges[f_idx][b_max+1]) / 2.0)
@@ -500,7 +520,8 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
 
                 with cols[i % 2]:
                     label = f"{name} (Current: {format_financial(name, curr_val)})"
-                    st.slider(label, s_min, s_max, (s_min, s_max), key=f"tab2_{name}")
+                    # Key depends on effort/timeframe to force reset when global strategy changes
+                    st.slider(label, s_min, s_max, (s_min, s_max), key=f"tab2_{name}_{base_effort}_{timeframe}")
 
         with tab_cat:
             for i, name in enumerate(meta["categorical_features"]):
@@ -531,49 +552,61 @@ if st.session_state.view_mode == "Individual" and st.session_state.user_idx is n
                 if f"cat_{name}" in st.session_state:
                     ui_constraints[name] = st.session_state[f"cat_{name}"]
         
-        with st.spinner("Generating recourse recommendations..."):
-            r_bins, r_cat, p_end = generate_demo_recourse(
+        with st.spinner("Generating multiple recourse recommendations..."):
+            recourse_candidates = generate_demo_recourse(
                 f_bins_t, torch.tensor(f_cat, dtype=torch.long), 
-                constraints=ui_constraints, k=150, 
-                lam=st.session_state.ui_lambda
+                constraints=ui_constraints, k=200, 
+                lam=st.session_state.ui_lambda,
+                num_results=10
             )
         
-        r_cont_vals = safe_inverse_transform(bin_edges, r_bins[0].tolist(), meta)
-        r_real = scaler.inverse_transform([r_cont_vals])[0]
-
-        # REPORTING
-        st.subheader("✅ Recommended Actions Summary")
-        m1, m2 = st.columns(2)
-        m1.metric("Target Prob", f"{p_end:.2%}", delta=f"{(p_end-p_fact):.2%}")
-        m2.metric("Result", "STRONG APPROVAL" if p_end > 0.95 else ("APPROVED" if p_end > 0.90 else "IMPROVED"), delta_color="normal")
-        
-        
-        comp_rows = []
-        for i, name in enumerate(meta["continuous_features"]):
-            if abs(r_real[i] - f_real[i]) > 1e-3:
-                comp_rows.append({
-                    "Feature": name, 
-                    "Current": format_financial(name, f_real[i]), 
-                    "Suggested": format_financial(name, r_real[i]), 
-                    "Delta": f"{r_real[i]-f_real[i]:+,.2f}",
-                    "Description": col_descriptions.get(name, "")
-                })
-        
-        for i, name in enumerate(meta["categorical_features"]):
-            if r_cat[0, i] != f_cat[0, i]:
-                inv_map = {v: k for k, v in meta["categorical_value_maps"][name].items()}
-                comp_rows.append({
-                    "Feature": name, 
-                    "Current": inv_map[f_cat[0, i]], 
-                    "Suggested": inv_map[r_cat[0, i].item()], 
-                    "Delta": "🔄 Transition",
-                    "Description": col_descriptions.get(name, "")
-                })
-        
-        if comp_rows:
-            st.dataframe(pd.DataFrame(comp_rows), width="stretch")
-        else:
+        if not recourse_candidates:
             st.warning("No changes found within constraints. Try adjusting your boundaries.")
+        else:
+            st.subheader("✅ Recommended Actions (Top Candidates)")
+            
+            # Create tabs for each candidate
+            tab_labels = [f"Option {i+1} ({cand['prob']:.1%})" for i, cand in enumerate(recourse_candidates)]
+            r_tabs = st.tabs(tab_labels)
+            
+            for i, cand in enumerate(recourse_candidates):
+                with r_tabs[i]:
+                    r_bins, r_cat, p_end = cand['bins'], cand['cat'], cand['prob']
+                    
+                    r_cont_vals = safe_inverse_transform(bin_edges, r_bins[0].tolist(), meta)
+                    r_real = scaler.inverse_transform([r_cont_vals])[0]
+
+                    # REPORTING
+                    m1, m2 = st.columns(2)
+                    m1.metric("Target Prob", f"{p_end:.2%}", delta=f"{(p_end-p_fact):.2%}")
+                    m2.metric("Result", "STRONG APPROVAL" if p_end > 0.95 else ("APPROVED" if p_end > 0.90 else "IMPROVED"), delta_color="normal")
+                    
+                    comp_rows = []
+                    for j, name in enumerate(meta["continuous_features"]):
+                        if abs(r_real[j] - f_real[j]) > 1e-3:
+                            comp_rows.append({
+                                "Feature": name, 
+                                "Current": format_financial(name, f_real[j]), 
+                                "Suggested": format_financial(name, r_real[j]), 
+                                "Delta": f"{r_real[j]-f_real[j]:+,.2f}",
+                                "Description": col_descriptions.get(name, "")
+                            })
+                    
+                    for j, name in enumerate(meta["categorical_features"]):
+                        if r_cat[0, j] != f_cat[0, j]:
+                            inv_map = {v: k for k, v in meta["categorical_value_maps"][name].items()}
+                            comp_rows.append({
+                                "Feature": name, 
+                                "Current": inv_map[f_cat[0, j]], 
+                                "Suggested": inv_map[r_cat[0, j].item()], 
+                                "Delta": "🔄 Transition",
+                                "Description": col_descriptions.get(name, "")
+                            })
+                    
+                    if comp_rows:
+                        st.dataframe(pd.DataFrame(comp_rows), width="stretch")
+                    else:
+                        st.info("This option suggests minimal changes.")
 
 elif st.session_state.view_mode == "Bulk":
     st.header("📊 Bulk Recourse Analysis Report")
